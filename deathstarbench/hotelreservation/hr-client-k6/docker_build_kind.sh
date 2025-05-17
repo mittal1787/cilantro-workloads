@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -e
 
-docker build . -t public.ecr.aws/cilantro/hr-client:latest
-docker push public.ecr.aws/cilantro/hr-client:latest
-kind load docker-image public.ecr.aws/cilantro/hr-client:latest
+docker build . -t yugm2/hr-client-k6:latest
+docker push yugm2/hr-client-k6:latest
+kind load docker-image yugm2/hr-client-k6:latest
