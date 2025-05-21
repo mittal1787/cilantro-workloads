@@ -25,45 +25,6 @@ class K6Driver(object):
                      'reservation', 'search', 'user']
 
 
-
-    def __init__(self,
-                 log_output_dir: str = None,
-                 k6_qps: int = None,
-                 k6_duration: int = 30,
-                 k6_preallocated_VUs: int = 30000,
-                 k6_url: str = 'http://frontend.default.svc.cluster.local:5000'
-                 ):
-        """
-        :param log_output_dir: Output dir for the logs
-        :param executable_path: Path to the wrk2 executable
-        :param workload_script_path: Path to the workload script
-        """
-        self.log_output_dir = log_output_dir
-        self.k6_qps = k6_qps
-        self.k6_duration = k6_duration
-        self.k6_preallocated_VUs = k6_preallocated_VUs
-        self.k6_url = k6_url
-        self.k6_filename = "hotel_reservation_k6.js"
-
-
-        # Init k8s clients
-        self.load_k8s_config()
-        self.appsapi = client.AppsV1Api()
-
-        # These are the number of resources allocated to all microservices
-        # This is externally controlled by k8s, we just need to poll it's state.
-        self.resource_allocs = self.get_alloc()
-        logger.info(f"Got an initial resource allocs: {self.resource_allocs}")
-
-        with open(self.k6_filename, "w") as f:
-            f.write(self.k6_file())
-
-        # Start thread to update resource count in background.
-        resource_update_thread = threading.Thread(
-            target=self.update_resource_alloc_thread, args=())
-        resource_update_thread.start()
-
-
     def k6_file(self):
         return """import http from 'k6/http';
 import { check, sleep } from 'k6';
@@ -76,8 +37,8 @@ export const options = {
         executor: 'constant-arrival-rate',
         rate:""" + f"{self.k6_qps}" + f""",
         timeUnit: '1s',
-        duration: '{self.k6_duration}',
-        preAllocatedVUs:{self.k6},
+        duration: '{self.k6_duration}s',
+        preAllocatedVUs:{self.k6_preallocated_VUs},
         maxVUs: 5000000,
         """ + """},
     },
@@ -190,8 +151,47 @@ export default function() {
 
 """
 
+
+    def __init__(self,
+                 log_output_dir: str = None,
+                 k6_qps: int = None,
+                 k6_duration: int = 30,
+                 k6_preallocated_VUs: int = 30000,
+                 k6_url: str = 'http://frontend.default.svc.cluster.local:5000'
+                 ):
+        """
+        :param log_output_dir: Output dir for the logs
+        :param executable_path: Path to the wrk2 executable
+        :param workload_script_path: Path to the workload script
+        """
+
+        self.log_output_dir = log_output_dir
+        self.k6_qps = k6_qps
+        self.k6_duration = k6_duration
+        self.k6_preallocated_VUs = k6_preallocated_VUs
+        self.k6_url = k6_url
+        self.k6_filename = "hotel_reservation_k6.js"
+
+
+        # Init k8s clients
+        self.load_k8s_config()
+        self.appsapi = client.AppsV1Api()
+
+        # These are the number of resources allocated to all microservices
+        # This is externally controlled by k8s, we just need to poll it's state.
+        self.resource_allocs = self.get_alloc()
+        logger.info(f"Got an initial resource allocs: {self.resource_allocs}")
+
+        with open(self.k6_filename, "w") as f:
+            f.write(self.k6_file())
+
+        # Start thread to update resource count in background.
+        resource_update_thread = threading.Thread(
+            target=self.update_resource_alloc_thread, args=())
+        resource_update_thread.start()
+
     def construct_command(self):
-        command = f"k6 run {self.k6_filename}"
+        command = f"k6 run {self.k6_filename} --out json={self.json_filepath} --summary-trend-stats \"min,avg,med,max,p(95),p(99),p(99.99)\""
         return command
 
     def load_k8s_config(self):
@@ -256,21 +256,27 @@ export default function() {
         The utility message is written as a json.
         :return:
         """
-        timestr = time.strftime("%Y%m%d-%H%M%S-%f")[:-3]
-        log_filename = "output_%s.log" % timestr  # This will be the final name of the log
-        log_filepath = os.path.join(self.log_output_dir, log_filename)
+        # timestr = time.strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        # log_filename = "output_%s.log" % timestr  # This will be the final name of the log
+        # log_filepath = os.path.join(self.log_output_dir, log_filename)
 
-        with open(log_filepath, 'w') as f:
+        with open(self.log_filepath, 'w') as f:
             f.write(json.dumps(avg_allocs) + '\n')
             f.write(str(qps) + '\n')
             f.write(f"event_start_time:{event_start_time}" + '\n')
             f.write(f"event_end_time:{event_end_time}" + '\n')
             f.write(wrk_stdout)
+            logger.info(wrk_stdout)
 
 
     def run_loop(self):
         while True:
             # Get the command
+            timestr = time.strftime("%Y%m%d-%H%M%S-%f")[:-3]
+            log_filename = "output_%s.log" % timestr  # This will be the final name of the log
+            json_filename = "output_%s.json" % timestr
+            self.log_filepath = os.path.join(self.log_output_dir, log_filename)
+            self.json_filepath = os.path.join(self.log_output_dir, json_filename)
             command = self.construct_command()
             logger.info(f"Running command: {command}")
             start_time = time.time()
@@ -281,16 +287,21 @@ export default function() {
                                         shell=True,
                                         stdout=subprocess.PIPE,
                                         stderr=subprocess.STDOUT)
+                # logger.info(f"Executed command {command}")
                 while proc.poll() is None:
                     # Update and average allocations while the job is running.
                     time.sleep(0.5)
                     allocs.append(self.resource_allocs) # This is updated in the background thread.
+                    logger.info("k6 still running")
                 end_time = time.time()
                 avg_allocs = self.average_list_of_dictionaries(allocs)
+                logger.info("Reading k6 run")
                 stdout, stderr = proc.communicate()
                 if stdout is not None:
+                    logger.info("Output produced when executing command")
                     stdout = stdout.decode('utf-8')
                 if stderr is not None:
+                    logger.info("Error occured when executing command")
                     stderr = stderr.decode('utf-8')
                 logger.info(f"Command finished with exit code {proc.returncode}")
                 if proc.returncode != 0:
